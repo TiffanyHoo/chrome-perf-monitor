@@ -15,6 +15,7 @@ import {
   formatValue,
   i18nLabel,
   buildReadableReport,
+  analyzeAdvice,
 } from "../shared.js";
 
 let tabId = null;
@@ -42,7 +43,9 @@ async function recapture() {
   await chrome.runtime.sendMessage({ type: "PANEL_RECAPTURE", tabId });
 }
 
-function gradeClass(g) { return g; }
+// 记录上次报告的 URL + capturedAt，用于检测是否有新数据
+let lastUrl = null;
+let lastCapturedAt = 0;
 
 async function render() {
   const resp = await fetchReport();
@@ -54,6 +57,10 @@ async function render() {
   const { rec, thresholds } = resp;
   const th = { ...DEFAULT_THRESHOLDS, ...(thresholds || {}) };
   const report = buildReadableReport(rec, th, rec.timingRaw || {});
+
+  // 记录当前档案标识
+  lastUrl = rec.url;
+  lastCapturedAt = rec.capturedAt || 0;
 
   // 调试输出：方便定位“时间轴数据没出来”到底卡在哪
   try {
@@ -84,6 +91,9 @@ async function render() {
     : `共 ${report.alerts.length} 项异常：${badN} 项较差、${warnN} 项需关注。`;
   el("capTime").textContent = rec.capturedAt ? new Date(rec.capturedAt).toLocaleString() : "—";
 
+  // 诊断结论（最顶部、最有价值）
+  renderDiagnosis(report, th);
+
   // timeline
   renderTimeline(report);
 
@@ -98,6 +108,58 @@ async function render() {
 
   // resources
   renderResources(rec);
+}
+
+function renderDiagnosis(report, th) {
+  const d = report.diagnosis;
+  if (!d) return;
+
+  // 一句话总评
+  el("verdict").textContent = d.verdict || "—";
+
+  // Core Web Vitals 达标判定
+  const vitalMap = [
+    { id: "vitalLcp", key: "lcp", label: "LCP", fmt: (v) => v != null ? formatValue("lcp", v) : "—" },
+    { id: "vitalCls", key: "cls", label: "CLS", fmt: (v) => v != null ? v.toFixed(3) : "—" },
+    { id: "vitalTbt", key: "inp", label: "TBT", fmt: (v) => v != null ? formatValue("tbt", v) : "—" },
+  ];
+  const passText = { pass: "达标", needs: "需改善", fail: "不达标", unknown: "未采集" };
+  for (const vm of vitalMap) {
+    const r = d.vitalResults[vm.key];
+    const box = el(vm.id);
+    box.className = "vital-box " + (r?.pass || "unknown");
+    box.querySelector(".vital-value").textContent = vm.fmt(r?.value);
+    box.querySelector(".vital-status").textContent = passText[r?.pass || "unknown"];
+    box.querySelector(".vital-status").className = "vital-status " + (r?.pass || "unknown");
+  }
+
+  // 最大瓶颈
+  const bnBox = el("bottleneck");
+  if (d.bottleneck) {
+    bnBox.classList.remove("hidden");
+    const b = d.bottleneck;
+    el("bottleneckContent").innerHTML =
+      `<b>${b.label}</b>（${formatValue(b.key, b.value)}，${GRADE_TEXT[b.grade]}）` +
+      `<br/>${b.what || ""}` +
+      `<br/><b>怎么改：</b>${b.howToFix || ""}`;
+  } else {
+    bnBox.classList.add("hidden");
+  }
+
+  // 优先级建议
+  const prBox = el("priorities");
+  if (d.topPriorities && d.topPriorities.length) {
+    prBox.classList.remove("hidden");
+    const list = el("priorityList");
+    list.innerHTML = "";
+    for (const p of d.topPriorities) {
+      const li = document.createElement("li");
+      li.innerHTML = `<b>${p.label}</b>（${formatValue(p.key, p.value)}）— ${p.howToFix || ""}`;
+      list.appendChild(li);
+    }
+  } else {
+    prBox.classList.add("hidden");
+  }
 }
 
 function renderTimeline(report) {
@@ -237,6 +299,8 @@ function renderGroups(report, th) {
 
       const body = document.createElement("div");
       body.className = "metric-body";
+      // 动态建议：根据实际数据组合分析，非写死文案
+      const dynamicFix = analyzeAdvice(it.key, report.metrics || rec.metrics || {}, report.diagnosis?.networkSlow);
       body.innerHTML = `
         <div class="metric-section">
           <div class="metric-section-title">这是什么</div>
@@ -247,8 +311,8 @@ function renderGroups(report, th) {
           <div class="metric-section-text">${it.whySlow || "—"}</div>
         </div>
         <div class="metric-section">
-          <div class="metric-section-title">怎么改善</div>
-          <div class="metric-section-text metric-howto">${it.howToFix || "—"}</div>
+          <div class="metric-section-title">当前页面的具体建议</div>
+          <div class="metric-section-text metric-howto">${dynamicFix || "该指标在良好区间，无需特别优化。"}</div>
         </div>`;
       row.appendChild(head);
       row.appendChild(body);
@@ -313,11 +377,37 @@ el("recapture").addEventListener("click", async () => {
 });
 el("refresh").addEventListener("click", render);
 
-// 初次渲染 + 监听页面导航（被检查页切换/刷新时刷新报告）
+// 初次渲染
 render();
+
+// 页面导航/刷新后：轮询等待新数据（不再用固定延迟，因为页面可能加载很慢）
+let navPollTimer = null;
 try {
-  chrome.devtools.network.onNavigated.addListener(() => { setTimeout(render, 1200); });
+  chrome.devtools.network.onNavigated.addListener(() => {
+    // 清掉旧的轮询
+    if (navPollTimer) clearInterval(navPollTimer);
+    // 导航后每隔 1 秒检查一次，直到拿到新数据（URL 变了或 capturedAt 变了），最多等 30 秒
+    const startTime = Date.now();
+    const prevUrl = lastUrl;
+    const prevCap = lastCapturedAt;
+    navPollTimer = setInterval(async () => {
+      const resp = await fetchReport();
+      const newRec = resp?.rec;
+      // 拿到新数据：URL 变了，或 capturedAt 比上次新
+      if (newRec && (newRec.url !== prevUrl || (newRec.capturedAt || 0) > prevCap)) {
+        clearInterval(navPollTimer);
+        navPollTimer = null;
+        render();
+      }
+      // 超时 30 秒放弃
+      if (Date.now() - startTime > 30000) {
+        clearInterval(navPollTimer);
+        navPollTimer = null;
+      }
+    }, 1000);
+  });
 } catch {}
+
 // 监听存储变化（content 上报后自动刷新）
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && changes.perfByTab) render();

@@ -252,14 +252,327 @@ export function buildReadableReport(rec, thresholds, timingRaw) {
   }
   const grade = overallGrade(metrics, thresholds);
   const alerts = collectAlerts(metrics, thresholds);
+  const diagnosis = buildDiagnosis(metrics, thresholds, alerts);
   return {
     url: rec?.url,
     title: rec?.title,
     capturedAt: rec?.capturedAt,
     grade,
     alerts,
+    diagnosis,
     items,
     // 时间轴总跨度：取所有 timeline end 的最大值（至少 1ms）
     timelineMax: Math.max(1, ...items.map((i) => i.timeline?.end ?? 0)),
   };
 }
+
+// ---- 诊断结论：把一堆 ms/KB 转成"人话" ----
+// 回答用户最关心的三个问题：
+//   1) 这页面到底快不快？→ 一句话总评 + Google Core Web Vitals 达标判定
+//   2) 慢在哪？→ 最大瓶颈定位（哪个阶段最耗时、哪个指标最差）
+//   3) 先改什么？→ 按收益排序的优先级建议
+export function buildDiagnosis(metrics, thresholds, alerts) {
+  const vitals = {
+    lcp: { value: metrics.lcp, ...gradeWithTh("lcp", metrics.lcp, thresholds) },
+    cls: { value: metrics.cls, ...gradeWithTh("cls", metrics.cls, thresholds) },
+    inp: { value: metrics.tbt, ...gradeWithTh("tbt", metrics.tbt, thresholds) }, // 用 TBT 近似 INP
+  };
+
+  // 全局网络慢检测：FCP、LCP、Load 都很慢且数值接近 → 网络瓶颈，不是渲染/服务端单一问题
+  const fcp = metrics.fcp, lcp = metrics.lcp, load = metrics.load;
+  const slowVals = [fcp, lcp, load].filter((v) => v != null && v > 3000);
+  let networkSlow = false;
+  if (slowVals.length >= 2) {
+    const maxV = Math.max(...slowVals);
+    const minV = Math.min(...slowVals);
+    // 数值接近（差距 < 20%）且都 > 3s → 整体网络慢
+    if (maxV > 0 && (maxV - minV) / maxV < 0.2) networkSlow = true;
+  }
+
+  // Google Core Web Vitals 达标线（2024 标准）
+  const vitalStandards = {
+    lcp: { good: 2500, poor: 4000 },
+    cls: { good: 0.1, poor: 0.25 },
+    inp: { good: 200, poor: 500 },
+  };
+  const vitalResults = {};
+  for (const k of ["lcp", "cls", "inp"]) {
+    const v = vitals[k].value;
+    const std = vitalStandards[k];
+    let pass = "unknown";
+    if (v != null && !Number.isNaN(v)) {
+      if (v <= std.good) pass = "pass";
+      else if (v <= std.poor) pass = "needs";
+      else pass = "fail";
+    }
+    vitalResults[k] = { value: v, pass, standard: std };
+  }
+
+  // 最大瓶颈：在所有有时长的指标里，找"最差等级 + 耗时最长"
+  let bottleneck = null;
+  for (const it of itemsWithMeta) {
+    const v = metrics[it.key];
+    if (v == null || !it.duration) continue;
+    const g = gradeMetric(it.key, v, thresholds);
+    if (g === "bad" || g === "warn") {
+      const advice = analyzeAdvice(it.key, metrics, networkSlow);
+      if (!bottleneck || v > bottleneck.value) {
+        bottleneck = { key: it.key, value: v, grade: g, label: i18nLabel(it.label), what: it.what, howToFix: advice };
+      }
+    }
+  }
+
+  // 一句话总评
+  const allPass = Object.values(vitalResults).every((r) => r.pass === "pass" || r.pass === "unknown");
+  const anyFail = Object.values(vitalResults).some((r) => r.pass === "fail");
+  let verdict;
+  if (networkSlow) {
+    verdict = "页面结构与服务端正常，慢速主要由网络带宽导致（FCP/LCP/Load 数值接近且都偏高），建议在弱网环境下用 CDN 与压缩改善。";
+  } else if (anyFail) {
+    verdict = "页面存在明显性能瓶颈，用户体验会受影响，建议尽快优化。";
+  } else if (allPass) {
+    verdict = "页面性能良好，核心体验指标全部达标。";
+  } else {
+    verdict = "页面性能基本可用，但有指标接近临界值，建议关注。";
+  }
+
+  // 优先级建议：按"等级最差 + 耗时最长"排序，取前 3
+  const priorities = [];
+  for (const a of alerts) {
+    const meta = METRIC_META[a.key];
+    if (!meta) continue;
+    const advice = analyzeAdvice(a.key, metrics, networkSlow);
+    priorities.push({
+      key: a.key,
+      value: a.value,
+      grade: a.grade,
+      label: i18nLabel(meta.label),
+      howToFix: advice,
+      weight: (a.grade === "bad" ? 1000 : 100) + (a.value || 0),
+    });
+  }
+  priorities.sort((a, b) => b.weight - a.weight);
+  const topPriorities = priorities.slice(0, 3);
+
+  return { verdict, vitalResults, bottleneck, topPriorities, networkSlow };
+}
+
+function gradeWithTh(key, value, thresholds) {
+  return { grade: gradeMetric(key, value, thresholds) };
+}
+
+// ---- 根据实际数据组合分析，给出针对性建议（非写死文案） ----
+// 输入：指标 key + 全量 metrics（可交叉引用其他指标推断原因）+ networkSlow 标记
+// 输出：针对当前页面的具体建议文本
+export function analyzeAdvice(key, m, networkSlow = false) {
+  const get = (k) => m[k];
+  const fmt = (k, v) => formatValue(k, v);
+
+  switch (key) {
+    // ---- 响应传输：区分"体积大"还是"网络慢" ----
+    case "response": {
+      const resp = get("response") || 0;
+      const size = get("transferSize") || 0; // bytes
+      const sizeKB = size / 1024;
+      const tips = [];
+      if (sizeKB > 200) {
+        tips.push(`文档体积 ${sizeKB.toFixed(0)} KB 偏大，启用 gzip/brotli 压缩可削减 60-80% 传输量`);
+        tips.push("检查是否在 HTML 中内联了大段 JSON/数据，移到后续异步请求");
+      } else if (sizeKB > 0 && sizeKB <= 50) {
+        tips.push(`文档体积仅 ${sizeKB.toFixed(0)} KB，但响应传输耗时 ${fmt(key, get(key))}，瓶颈在网络带宽而非体积，建议使用 CDN 边缘分发`);
+      } else if (sizeKB === 0) {
+        tips.push("无法读取文档体积（可能跨域限制），但传输耗时较长，建议检查服务端是否启用压缩与流式输出（尽早 flush <head>）");
+      } else {
+        tips.push(`文档体积 ${sizeKB.toFixed(0)} KB 中等，建议启用 brotli 压缩 + 尽早 flush <head> 让浏览器并行加载资源`);
+      }
+      // 如果 TTFB 也慢，补充服务端慢的判断
+      const ttfb = get("ttfb");
+      if (ttfb != null && ttfb > 500) {
+        tips.push(`首字节时间 ${fmt("ttfb", ttfb)} 也偏慢，说明服务端处理本身慢，响应传输慢可能与服务端延迟叠加`);
+      }
+      return tips.join("；");
+    }
+
+    // ---- LCP：区分"网络慢"、"首字节慢"、"主图慢"、"渲染阻塞" ----
+    case "lcp": {
+      const lcp = get("lcp") || 0;
+      const fcp = get("fcp");
+      const ttfb = get("ttfb");
+      const tips = [];
+      // 0) 全局网络慢
+      if (networkSlow) {
+        tips.push(`LCP ${fmt("lcp", lcp)} 慢，与 FCP/Load 数值接近，整体网络带宽是瓶颈`);
+        tips.push("CDN 边缘分发、压缩图片体积、减少首屏资源数量可显著改善");
+        return tips.join("；");
+      }
+      // 1) TTFB 占比高 → 服务端/网络是瓶颈
+      if (ttfb != null && ttfb / Math.max(lcp, 1) > 0.5) {
+        tips.push(`首字节时间 ${fmt("ttfb", ttfb)} 占 LCP 的 ${Math.round(ttfb / Math.max(lcp, 1) * 100)}%，服务端响应是主要瓶颈，优先优化后端处理速度与 CDN 边缘缓存`);
+      }
+      // 2) FCP 与 LCP 差距大 → 主图/大内容加载慢
+      if (fcp != null && lcp - fcp > 1000) {
+        tips.push(`FCP ${fmt("fcp", fcp)} 但 LCP 拖到 ${fmt("lcp", lcp)}，差距 ${(lcp - fcp).toFixed(0)} ms，说明首屏大图/大文本块加载慢，preload 首屏主图、优化为 WebP/AVIF、给图片设宽高`);
+      }
+      // 3) FCP 本身也慢（但不是网络慢）→ 渲染阻塞
+      if (fcp != null && fcp > 2000 && !networkSlow) {
+        tips.push(`FCP 也高达 ${fmt("fcp", fcp)}，可能被阻塞渲染的 CSS/JS 拖住，内联关键 CSS、preload 关键字体、延迟非首屏 JS`);
+      }
+      if (!tips.length) {
+        tips.push("preload 首屏主图；优化图片格式（WebP/AVIF）；内联关键 CSS；给图片设 width/height");
+      }
+      return tips.join("；");
+    }
+
+    // ---- FCP：区分"网络慢"、"首字节慢"、"渲染阻塞" ----
+    case "fcp": {
+      const fcp = get("fcp") || 0;
+      const ttfb = get("ttfb");
+      const tips = [];
+      // 0) 全局网络慢 → 不是渲染阻塞问题
+      if (networkSlow) {
+        tips.push(`FCP ${fmt("fcp", fcp)} 慢，且 FCP/LCP/Load 数值接近，说明是整体网络带宽瓶颈而非渲染阻塞`);
+        tips.push("服务端与页面结构正常，建议使用 CDN 边缘分发、启用 HTTP/2 资源复用、压缩传输减少数据量");
+        return tips.join("；");
+      }
+      if (ttfb != null && ttfb / Math.max(fcp, 1) > 0.5) {
+        tips.push(`首字节时间 ${fmt("ttfb", ttfb)} 占 FCP 的 ${Math.round(ttfb / Math.max(fcp, 1) * 100)}%，优化后端响应速度收益最大`);
+      } else {
+        tips.push("首字节正常，FCP 慢主要因渲染阻塞：内联关键 CSS、preload 关键字体/图片、defer 非首屏脚本");
+      }
+      if (ttfb != null && ttfb < 300 && fcp > 2000) {
+        tips.push("服务端很快但首屏渲染仍慢，大概率是 HTML 中阻塞渲染的 CSS/同步 JS，检查 <head> 内是否有大 CSS/JS");
+      }
+      return tips.join("；");
+    }
+
+    // ---- TTFB：区分"服务端处理慢"还是"网络慢" ----
+    case "ttfb": {
+      const ttfb = get("ttfb") || 0;
+      const dns = get("dns");
+      const tcp = get("tcp");
+      const tips = [];
+      if (dns != null && dns + (tcp || 0) > ttfb * 0.4) {
+        tips.push(`DNS+TCP 耗时 ${(dns + (tcp || 0)).toFixed(0)} ms 占比较高，连接建立是瓶颈，启用连接复用（keep-alive/HTTP2）与 DNS 预解析`);
+      } else {
+        tips.push("DNS/TCP 正常，首字节慢主要因服务端处理，启用 CDN 边缘缓存、后端接口异步化、消除 N+1 查询");
+      }
+      if (ttfb > 1000) {
+        tips.push("首字节超过 1 秒，检查是否存在服务端冷启动或数据库慢查询");
+      }
+      return tips.join("；");
+    }
+
+    // ---- CLS：区分"图片无尺寸"、"动态插入"、"字体替换" ----
+    case "cls": {
+      const cls = get("cls") || 0;
+      const tips = [];
+      if (cls > 0.25) {
+        tips.push("布局偏移严重（>0.25），页面内容大面积移动，最可能原因：图片/广告/iframe 无尺寸属性");
+      } else {
+        tips.push("布局偏移中等，检查是否有延迟加载的图片/广告未预留空间");
+      }
+      tips.push("给所有图片/iframe 设 width/height；预留广告/动态区占位；字体用 font-display:optional 或 preload");
+      return tips.join("；");
+    }
+
+    // ---- TBT：区分"JS 体积大"还是"长任务多" ----
+    case "tbt": {
+      const tbt = get("tbt") || 0;
+      const fcp = get("fcp");
+      const tips = [];
+      if (tbt > 600) {
+        tips.push("主线程被严重阻塞，首屏 JS 体积可能过大或第三方脚本抢占主线程，拆分/延迟非首屏 JS");
+      } else if (tbt > 200) {
+        tips.push("主线程有一定阻塞，检查是否有长任务可切片（用 scheduler.yield 或 setTimeout 分片）");
+      }
+      if (fcp != null && fcp > 2000) {
+        tips.push("FCP 也慢，渲染与交互都受影响，优先精简首屏 JS");
+      }
+      tips.push("减少首屏第三方脚本数量，用 requestIdleCallback 做次要工作");
+      return tips.join("；");
+    }
+
+    // ---- DNS ----
+    case "dns": {
+      const dns = get("dns") || 0;
+      if (dns > 200) {
+        return "DNS 解析耗时较长，对稳定域名增加 dns-prefetch 与 DNS 缓存 TTL，减少第三方资源域名数量";
+      }
+      return "DNS 正常，无需特别优化";
+    }
+
+    // ---- TCP ----
+    case "tcp": {
+      const tcp = get("tcp") || 0;
+      if (tcp > 200) {
+        return "TCP 连接耗时较长，启用 keep-alive 连接复用与 HTTP/2 多路复用，减少重复握手";
+      }
+      return "TCP 连接正常，无需特别优化";
+    }
+
+    // ---- SSL ----
+    case "ssl": {
+      const ssl = get("ssl") || 0;
+      if (ssl > 300) {
+        return "SSL 握手耗时较长，启用 TLS 1.3、配置证书链、启用会话恢复与 OCSP Stapling";
+      }
+      return "SSL 握手正常，无需特别优化";
+    }
+
+    // ---- DOM 解析 ----
+    case "domParse": {
+      const dp = get("domParse") || 0;
+      const tips = [];
+      if (dp > 2000) {
+        tips.push("DOM 解析非常慢，HTML 可能过大或同步脚本阻塞，检查是否内联大段数据、是否大量同步 <script>");
+      } else if (dp > 800) {
+        tips.push("DOM 解析偏慢，给非首屏脚本加 defer/async，减少 DOM 节点数");
+      }
+      tips.push("移除内联大 JSON，减少嵌套深度");
+      return tips.join("；");
+    }
+
+    // ---- DOMContentLoaded ----
+    case "domReady": {
+      const dr = get("domReady") || 0;
+      if (dr > 1500) {
+        return "DOMContentLoaded 回调耗时较长，业务框架初始化可能过重，把非首屏初始化拆到 requestIdleCallback 或微任务延后";
+      }
+      return "DOMContentLoaded 正常，无需特别优化";
+    }
+
+    // ---- 可交互 ----
+    case "interactive": {
+      const it = get("interactive") || 0;
+      const ttfb = get("ttfb");
+      const tips = [];
+      if (ttfb != null && ttfb / Math.max(it, 1) > 0.4) {
+        tips.push(`首字节 ${fmt("ttfb", ttfb)} 占比较高，先优化服务端响应`);
+      }
+      tips.push("优先保证首屏可交互：关键脚本同步/内联，非关键脚本 defer，减少首屏 JS 体积");
+      return tips.join("；");
+    }
+
+    // ---- 页面完全加载 ----
+    case "load": {
+      const load = get("load") || 0;
+      const tips = [];
+      if (networkSlow) {
+        tips.push(`整页加载 ${fmt("load", load)} 慢，与 FCP/LCP 数值接近，网络带宽是主要瓶颈，服务端和页面结构正常`);
+        tips.push("CDN 边缘分发、压缩传输减少数据量、启用 HTTP/2 资源复用");
+        return tips.join("；");
+      }
+      if (load > 4000) {
+        tips.push("整页加载超过 4 秒，拆分首屏与次屏资源，图片用 loading=lazy 延迟加载");
+      }
+      tips.push("预连接关键第三方域名，删除无用资源，延迟加载非首屏 iframe");
+      return tips.join("；");
+    }
+
+    default:
+      return "参考该指标的通用优化建议。";
+  }
+}
+
+// itemsWithMeta: 便于 buildDiagnosis 遍历（不依赖 buildReadableReport 的 items）
+const itemsWithMeta = Object.keys(METRIC_META).map((k) => ({ key: k, ...METRIC_META[k] }));

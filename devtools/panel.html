@@ -38,6 +38,48 @@
         </div>
       </section>
 
+      <!-- 诊断结论：最有价值的部分 -->
+      <section class="card diagnosis-card">
+        <div class="card-title">诊断结论</div>
+
+        <!-- 一句话总评 -->
+        <div id="verdict" class="verdict">—</div>
+
+        <!-- Core Web Vitals 达标判定 -->
+        <div class="vitals-row">
+          <div class="vital-box" id="vitalLcp">
+            <div class="vital-name">LCP</div>
+            <div class="vital-value">—</div>
+            <div class="vital-status">—</div>
+            <div class="vital-desc">最大内容绘制：首屏主要内容多久可见</div>
+          </div>
+          <div class="vital-box" id="vitalCls">
+            <div class="vital-name">CLS</div>
+            <div class="vital-value">—</div>
+            <div class="vital-status">—</div>
+            <div class="vital-desc">累计布局偏移：内容会不会乱跳</div>
+          </div>
+          <div class="vital-box" id="vitalTbt">
+            <div class="vital-name">TBT</div>
+            <div class="vital-value">—</div>
+            <div class="vital-status">—</div>
+            <div class="vital-desc">总阻塞时间：看着好了但点不动</div>
+          </div>
+        </div>
+
+        <!-- 最大瓶颈 -->
+        <div id="bottleneck" class="bottleneck hidden">
+          <div class="bottleneck-title">最大瓶颈</div>
+          <div id="bottleneckContent"></div>
+        </div>
+
+        <!-- 优先级建议 -->
+        <div id="priorities" class="priorities hidden">
+          <div class="bottleneck-title">建议优先优化（按收益排序）</div>
+          <ol id="priorityList"></ol>
+        </div>
+      </section>
+
       <!-- 可视化时间轴 -->
       <section class="card">
         <div class="card-title">加载时间轴 <span class="card-hint">各阶段在页面生命周期中的位置与占比（相对导航起点）</span></div>

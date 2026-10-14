@@ -146,8 +146,13 @@
     };
     try {
       await chrome.runtime.sendMessage({ type: "PERF_REPORT", payload });
+      console.log("[性能监控] 上报成功，url:", payload.url);
     } catch (e) {
-      // service worker 可能休眠；忽略
+      console.warn("[性能监控] 上报失败:", e, "1 秒后重试");
+      // service worker 可能休眠，延迟重试一次
+      setTimeout(() => {
+        chrome.runtime.sendMessage({ type: "PERF_REPORT", payload }).catch(() => {});
+      }, 1000);
     }
   }
 
