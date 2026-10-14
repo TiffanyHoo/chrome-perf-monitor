@@ -300,7 +300,7 @@ function renderGroups(report, th) {
       const body = document.createElement("div");
       body.className = "metric-body";
       // 动态建议：根据实际数据组合分析，非写死文案
-      const dynamicFix = analyzeAdvice(it.key, report.metrics || rec.metrics || {}, report.diagnosis?.networkSlow);
+      const dynamicFix = analyzeAdvice(it.key, report.metrics || {}, report.diagnosis?.networkSlow);
       body.innerHTML = `
         <div class="metric-section">
           <div class="metric-section-title">这是什么</div>
