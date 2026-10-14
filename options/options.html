@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>页面性能监控 — 阈值配置</title>
+<link rel="stylesheet" href="options.css" />
+</head>
+<body>
+  <main class="wrap">
+    <h1 data-i18n="optTitle">阈值配置</h1>
+    <p class="hint" data-i18n="optThresholds">性能阈值（单位：毫秒；CLS 为无量纲）</p>
+
+    <section class="card">
+      <h2>告警开关</h2>
+      <label class="row"><input type="checkbox" id="optBadge" /> <span data-i18n="optBadge">显示徽标颜色告警</span></label>
+      <label class="row"><input type="checkbox" id="optAutoAnalyze" /> <span data-i18n="optAutoAnalyze">刷新页面自动重新分析</span></label>
+    </section>
+
+    <section class="card">
+      <h2>指标阈值</h2>
+      <table class="tbl">
+        <thead>
+          <tr><th>指标</th><th>良好上限</th><th>关注上限</th><th>单位</th></tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </section>
+
+    <div class="actions">
+      <button id="save" class="btn primary" data-i18n="optSave">保存</button>
+      <span id="saved" class="saved hidden" data-i18n="optSaved">已保存</span>
+    </div>
+  </main>
+  <script type="module" src="options.js"></script>
+</body>
+</html>

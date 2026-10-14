@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>页面性能监控</title>
+<link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header class="hdr">
+    <div class="hdr-left">
+      <img src="../icons/icon-48.png" alt="" class="logo" />
+      <span class="hdr-title" data-i18n="popupTitle">当前页面性能</span>
+    </div>
+    <button id="recapture" class="btn" data-i18n="replay">重新采集</button>
+  </header>
+
+  <section id="summary" class="summary hidden">
+    <div id="gradeBox" class="grade-box">
+      <div id="gradeDot" class="grade-dot"></div>
+      <div class="grade-text">
+        <div id="gradeLabel" class="grade-label">—</div>
+        <div id="gradeDesc" class="grade-desc">—</div>
+      </div>
+    </div>
+    <div class="meta">
+      <div><span data-i18n="urlLabel">页面</span>: <span id="metaUrl" class="ellipsis" title=""></span></div>
+      <div><span data-i18n="timeLabel">采集时间</span>: <span id="metaTime"></span></div>
+    </div>
+  </section>
+
+  <section id="alerts" class="alerts hidden">
+    <div class="section-title">告警</div>
+    <ul id="alertList" class="alert-list"></ul>
+  </section>
+
+  <section id="metrics" class="metrics hidden">
+    <div class="section-title">指标明细</div>
+    <div id="metricGroups" class="metric-groups"></div>
+  </section>
+
+  <section id="empty" class="empty">
+    <div data-i18n="noData">暂无性能数据，请（重新）加载页面。</div>
+  </section>
+
+  <footer class="ftr">
+    <a id="optionsLink" href="#" data-i18n="optTitle">阈值配置</a>
+  </footer>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>
